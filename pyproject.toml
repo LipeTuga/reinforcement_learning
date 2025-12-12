@@ -13,7 +13,9 @@ dependencies = [
     "yfinance (>=0.2.61,<0.3.0)",
     "notebook (>=7.4.2,<8.0.0)",
     "shimmy (>=2.0.0,<3.0.0)",
-    "sb3-contrib @ git+https://github.com/Stable-Baselines-Team/stable-baselines3-contrib"
+    "sb3-contrib @ git+https://github.com/Stable-Baselines-Team/stable-baselines3-contrib",
+    "python-dotenv (>=1.1.0,<2.0.0)",
+    "fastparquet (>=2024.11.0,<2025.0.0)"
 ]
 
 [tool.poetry]
