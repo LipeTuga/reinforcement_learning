@@ -9,56 +9,52 @@ def calculate_trading_stats(
     prices: List[float]
 ) -> Dict[str, float]:
     """
-    Calculate comprehensive trading statistics.
+    Calculate comprehensive trading statistics for SHORT-ONLY trading.
 
     Args:
-        actions: List of actions taken (0=hold, 1=buy, 2=sell)
+        actions: List of actions taken (0=hold, 1=short, 2=cover)
         net_worths: List of net worth values at each step
         prices: List of asset prices at each step
 
     Returns:
         Dictionary containing:
-        - total_trades: Total number of buy+sell actions
-        - num_buys: Number of buy actions
-        - num_sells: Number of sell actions
+        - total_trades: Total number of short+cover actions
+        - num_shorts: Number of short (open position) actions
+        - num_covers: Number of cover (close position) actions
         - win_rate: Percentage of profitable trades
         - profit_factor: Gross profit / Gross loss
-        - avg_profit_per_trade: Average profit when selling
-        - avg_loss_per_trade: Average loss when selling
-        - avg_holding_period: Average days held between buy and sell
+        - avg_profit_per_trade: Average profit when covering
+        - avg_loss_per_trade: Average loss when covering
+        - avg_holding_period: Average days held between short and cover
 
     Example:
-        >>> actions = [1, 0, 0, 2, 1, 2]  # Buy, hold, hold, sell, buy, sell
+        >>> actions = [1, 0, 0, 2, 1, 2]  # Short, hold, hold, cover, short, cover
         >>> net_worths = [10000, 10100, 10200, 10300, 10200, 10400]
-        >>> prices = [100, 101, 102, 103, 102, 104]
+        >>> prices = [100, 99, 98, 97, 98, 96]  # Prices going down = profit for shorts
         >>> stats = calculate_trading_stats(actions, net_worths, prices)
     """
     actions_array = np.array(actions)
     net_worths_array = np.array(net_worths)
 
-    # Count actions
-    num_buys = np.sum(actions_array == 1)
-    num_sells = np.sum(actions_array == 2)
-    total_trades = num_buys + num_sells
-
-    # Track trades for profit analysis
-    buy_indices = np.where(actions_array == 1)[0]
-    sell_indices = np.where(actions_array == 2)[0]
+    # Count actions (1=short/open, 2=cover/close)
+    num_shorts = np.sum(actions_array == 1)
+    num_covers = np.sum(actions_array == 2)
+    total_trades = num_shorts + num_covers
 
     profits = []
     losses = []
     holding_periods = []
 
-    # Match buys with sells
-    current_buy_idx = None
+    # Match shorts with covers (action 1 opens position, action 2 closes it)
+    current_open_idx = None
     for i, action in enumerate(actions_array):
-        if action == 1:  # Buy
-            current_buy_idx = i
-        elif action == 2 and current_buy_idx is not None:  # Sell after buy
+        if action == 1:  # Short (open position)
+            current_open_idx = i
+        elif action == 2 and current_open_idx is not None:  # Cover (close position)
             # Calculate profit/loss
-            net_worth_at_buy = net_worths_array[current_buy_idx]
-            net_worth_at_sell = net_worths_array[i]
-            pnl = net_worth_at_sell - net_worth_at_buy
+            net_worth_at_open = net_worths_array[current_open_idx]
+            net_worth_at_close = net_worths_array[i]
+            pnl = net_worth_at_close - net_worth_at_open
 
             if pnl > 0:
                 profits.append(pnl)
@@ -66,10 +62,10 @@ def calculate_trading_stats(
                 losses.append(abs(pnl))
 
             # Calculate holding period
-            holding_period = i - current_buy_idx
+            holding_period = i - current_open_idx
             holding_periods.append(holding_period)
 
-            current_buy_idx = None  # Reset for next trade
+            current_open_idx = None  # Reset for next trade
 
     # Calculate statistics
     win_rate = len(profits) / (len(profits) + len(losses)) if (len(profits) + len(losses)) > 0 else 0.0
@@ -84,8 +80,10 @@ def calculate_trading_stats(
 
     return {
         "total_trades": int(total_trades),
-        "num_buys": int(num_buys),
-        "num_sells": int(num_sells),
+        "num_buys": int(num_shorts),      # Keep for backwards compatibility
+        "num_sells": int(num_covers),     # Keep for backwards compatibility
+        "num_shorts": int(num_shorts),    # New naming
+        "num_covers": int(num_covers),    # New naming
         "win_rate": float(win_rate),
         "profit_factor": float(profit_factor) if profit_factor != float('inf') else 999.99,
         "avg_profit_per_trade": float(avg_profit),

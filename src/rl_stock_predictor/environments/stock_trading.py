@@ -11,32 +11,33 @@ from ..utils.paths import PLOTS_DIR
 
 class StockTradingEnv(gym.Env):
     """
-    Custom Gym environment for stock trading with reinforcement learning.
+    Custom Gym environment for SHORT-ONLY stock trading with reinforcement learning.
 
-    The environment simulates a simple stock trading scenario where an agent
-    can buy, sell, or hold a single stock. The goal is to maximize net worth
-    by making profitable trading decisions.
+    The environment simulates short selling where an agent profits when prices DROP.
+    Short selling: Borrow shares → Sell at current price → Buy back later → Return shares
 
     Action Space:
         Discrete(3):
             0 - Hold: Do nothing
-            1 - Buy: Purchase stock with all available cash
-            2 - Sell: Sell all held shares
+            1 - Short: Open short position (borrow and sell shares)
+            2 - Cover: Close short position (buy back shares)
 
     Observation Space:
         Box(window_size, num_features): A sliding window of historical OHLCV data
 
     Reward:
-        Based on change in net worth, with penalties for holding stocks too long
+        Based on change in net worth (profits when price goes DOWN)
     """
 
-    def __init__(self, df, normalize_fn=None):
+    def __init__(self, df, normalize_fn=None, transaction_cost=0.001, margin_requirement=0.5):
         """
         Initialize the trading environment.
 
         Args:
             df: DataFrame with OHLCV columns
             normalize_fn: Optional function to normalize the data
+            transaction_cost: Transaction cost as a fraction (default 0.1%)
+            margin_requirement: Fraction of balance to use as margin (default 50%)
         """
         super(StockTradingEnv, self).__init__()
         self.original_df = df.copy()
@@ -48,8 +49,8 @@ class StockTradingEnv(gym.Env):
         self.n_steps = len(self.df)
         self.current_step = 0
 
-        # ACTIONS
-        self.action_space = spaces.Discrete(3)  # 0: hold, 1: buy, 2: sell
+        # ACTIONS: 0=hold, 1=short, 2=cover
+        self.action_space = spaces.Discrete(3)
 
         # OBSERVATION SPACE
         self.window_size = 14
@@ -60,15 +61,23 @@ class StockTradingEnv(gym.Env):
             dtype=np.float32
         )
 
-        # SET VARIABLES TO CONTROL REWARDS
+        # TRADING PARAMETERS
+        self.transaction_cost = transaction_cost  # 0.1% per trade
+        self.margin_requirement = margin_requirement  # Use 50% of balance for shorting
+        self.min_net_worth = 1000  # Bankruptcy threshold (10% of initial)
+
+        # SHORT TRADING VARIABLES
         self.initial_balance = 10000
-        self.balance = self.initial_balance
-        self.shares_held = 0
+        self.balance = self.initial_balance  # Cash (increases when shorting)
+        self.shares_shorted = 0              # Number of shares we owe
+        self.short_entry_price = 0           # Price at which we entered short
         self.net_worth = self.initial_balance
         self.max_net_worth = self.initial_balance
         self.last_net_worth = self.initial_balance
         self.number_days_hold = 1
         self.cumulative_reward = 0
+        self.total_trades = 0
+        self.profitable_trades = 0
 
     def _next_observation(self):
         """
@@ -94,62 +103,138 @@ class StockTradingEnv(gym.Env):
         Execute one step in the environment.
 
         Args:
-            action: Action to take (0=hold, 1=buy, 2=sell)
+            action: Action to take (0=hold, 1=short, 2=cover)
 
         Returns:
             Tuple of (observation, reward, terminated, truncated, info)
         """
         current_price = float(self.original_df.iloc[self.current_step]["Close"])
         executed_action = 0
+        trade_cost = 0
+        invalid_action_penalty = 0
 
-        if action == 1:  # Buy
-            if self.balance > 0:
-                self.shares_held = self.balance / current_price
-                self.balance = 0
+        if action == 1:  # Short (open short position)
+            if self.shares_shorted == 0 and self.balance > 0:
+                # Use margin_requirement of balance for shorting (default 50%)
+                margin_used = self.balance * self.margin_requirement
+                self.shares_shorted = margin_used / current_price
+                self.short_entry_price = current_price
+
+                # Receive cash from selling borrowed shares
+                sale_proceeds = self.shares_shorted * current_price
+                trade_cost = sale_proceeds * self.transaction_cost
+                self.balance = self.balance + sale_proceeds - trade_cost
+
+                self.total_trades += 1
                 executed_action = 1
-        elif action == 2:  # Sell
-            if self.shares_held > 0:
-                self.balance = self.shares_held * current_price
-                self.shares_held = 0
+            else:
+                # Invalid: trying to short when already in position
+                invalid_action_penalty = -0.5
+
+        elif action == 2:  # Cover (close short position)
+            if self.shares_shorted > 0:
+                # Buy back shares to close short position
+                cost_to_cover = self.shares_shorted * current_price
+                trade_cost = cost_to_cover * self.transaction_cost
+                self.balance = self.balance - cost_to_cover - trade_cost
+
+                # Track profitable trades
+                if current_price < self.short_entry_price:
+                    self.profitable_trades += 1
+
+                self.shares_shorted = 0
+                self.short_entry_price = 0
+                self.total_trades += 1
                 executed_action = 2
                 self.number_days_hold = 1
+            else:
+                # Invalid: trying to cover when no position open
+                invalid_action_penalty = -0.5
 
-        if self.shares_held > 0:
-            self.number_days_hold += 1  # Increment by 1 each day holding
+        # Track holding days for short position
+        if self.shares_shorted > 0:
+            self.number_days_hold += 1
         else:
-            self.number_days_hold = 1  # Reset when not holding
+            self.number_days_hold = 1
 
-        self.net_worth = self.balance + self.shares_held * current_price
+        # Calculate net worth for short position:
+        # net_worth = cash - liability (what we owe = shares_shorted * current_price)
+        short_liability = self.shares_shorted * current_price
+        self.net_worth = self.balance - short_liability
 
-        # Normalized reward: percentage change in net worth (typically -1 to +1 range)
-        # This makes learning much more stable than raw dollar amounts
-        pct_change = (self.net_worth - self.last_net_worth) / self.last_net_worth
-        base_reward = pct_change * 100  # Scale to roughly -1 to +1 for typical daily moves
+        # Check for bankruptcy
+        bankrupt = self.net_worth < self.min_net_worth
 
-        # Apply holding penalty after 10 days to encourage active trading
-        if self.number_days_hold > 10:
-            holding_penalty = 0.01 * (self.number_days_hold - 10)  # Small penalty per extra day
-            reward = base_reward - holding_penalty
-        else:
-            reward = base_reward
+        # IMPROVED REWARD FUNCTION
+        reward = self._calculate_reward(current_price, executed_action, trade_cost)
+        reward += invalid_action_penalty  # Penalize invalid actions
 
         self.cumulative_reward += reward
-
         self.last_net_worth = self.net_worth
+        self.max_net_worth = max(self.max_net_worth, self.net_worth)
         self.net_worths.append(self.net_worth)
         self.actions.append(executed_action)
 
         self.current_step += 1
-        terminated = self.current_step >= len(self.df) - 1
-        truncated = False  # Or set appropriate truncation logic
+        terminated = self.current_step >= len(self.df) - 1 or bankrupt
+        truncated = False
+
+        # Calculate win rate for info
+        win_rate = self.profitable_trades / max(1, self.total_trades // 2)  # Divide by 2 since each round trip is 2 trades
 
         return self._next_observation(), reward, terminated, truncated, {
             "net_worth": self.net_worth,
-            "shares_held": self.shares_held,
+            "shares_shorted": self.shares_shorted,
+            "short_liability": short_liability,
             "cumulative_reward": self.cumulative_reward,
             "balance": self.balance,
             "actions": self.actions,
+            "current_price": current_price,
+            "bankrupt": bankrupt,
+            "total_trades": self.total_trades,
+            "win_rate": win_rate,
         }
+
+    def _calculate_reward(self, current_price, executed_action, trade_cost):
+        """
+        Calculate reward with improved signal quality.
+
+        Reward components:
+        1. Base reward: percentage change in net worth (scaled)
+        2. Trade cost penalty: discourages excessive trading
+        3. Holding penalty: stronger penalty for holding too long
+        4. Profit bonus: extra reward for profitable trades
+        5. Drawdown penalty: penalize large losses from peak
+        """
+        # 1. Base reward: percentage change in net worth
+        if self.last_net_worth > 0:
+            pct_change = (self.net_worth - self.last_net_worth) / self.last_net_worth
+        else:
+            pct_change = 0
+
+        # Scale reward to reasonable range (multiply by 10 instead of 100)
+        base_reward = pct_change * 10
+
+        # 2. Trade cost penalty (already reflected in net worth, but add small explicit penalty)
+        trade_penalty = -0.01 if executed_action > 0 else 0
+
+        # 3. Holding penalty: stronger penalty after 5 days
+        holding_penalty = 0
+        if self.shares_shorted > 0 and self.number_days_hold > 5:
+            holding_penalty = -0.05 * (self.number_days_hold - 5)
+
+        # 4. Profit bonus for successful cover
+        profit_bonus = 0
+        if executed_action == 2 and self.net_worth > self.last_net_worth:
+            profit_bonus = 0.5  # Bonus for profitable trade
+
+        # 5. Drawdown penalty: penalize being far below peak
+        drawdown = (self.max_net_worth - self.net_worth) / self.max_net_worth
+        drawdown_penalty = -drawdown * 0.1 if drawdown > 0.1 else 0  # Only penalize >10% drawdown
+
+        reward = base_reward + trade_penalty + holding_penalty + profit_bonus + drawdown_penalty
+
+        return reward
 
     def reset(self, *, seed=None, options=None):
         """
@@ -165,10 +250,15 @@ class StockTradingEnv(gym.Env):
         super().reset(seed=seed)
         self.current_step = self.window_size - 1
         self.balance = self.initial_balance
-        self.shares_held = 0
+        self.shares_shorted = 0
+        self.short_entry_price = 0
         self.net_worth = self.initial_balance
         self.max_net_worth = self.initial_balance
         self.last_net_worth = self.initial_balance
+        self.number_days_hold = 1
+        self.cumulative_reward = 0
+        self.total_trades = 0
+        self.profitable_trades = 0
         self.net_worths = []
         self.actions = []
         return self._next_observation(), {}
@@ -179,7 +269,7 @@ class StockTradingEnv(gym.Env):
 
         Saves a plot showing:
         - Net worth trajectory
-        - Buy/sell/hold actions as colored markers
+        - Short/Cover/Hold actions as colored markers
         """
         if not hasattr(self, "net_worths") or len(self.net_worths) == 0:
             print("No data to render yet.")
@@ -194,16 +284,14 @@ class StockTradingEnv(gym.Env):
         # Plot net worth
         plt.plot(self.net_worths, label='Net Worth', color='blue')
 
-        # Optional: show buy/sell points
+        # Show short/cover points
         for i, action in enumerate(self.actions):
-            if action == 1:  # Buy
-                plt.scatter(i, self.net_worths[i], marker='^', color='green')
-            elif action == 2:  # Sell
-                plt.scatter(i, self.net_worths[i], marker='v', color='red')
-            elif action == 0:
-                plt.scatter(i, self.net_worths[i], marker='o', color='black')
+            if action == 1:  # Short (open position)
+                plt.scatter(i, self.net_worths[i], marker='v', color='red', s=100, label='Short' if i == 0 else '')
+            elif action == 2:  # Cover (close position)
+                plt.scatter(i, self.net_worths[i], marker='^', color='green', s=100, label='Cover' if i == 0 else '')
 
-        plt.title("Net Worth Over Time")
+        plt.title("Net Worth Over Time (Short-Only Trading)")
         plt.xlabel("Time Step")
         plt.ylabel("Net Worth")
         plt.legend()

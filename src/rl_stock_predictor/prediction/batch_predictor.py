@@ -4,6 +4,7 @@ import pandas as pd
 from pathlib import Path
 from typing import List, Optional
 from sb3_contrib import RecurrentPPO
+from stable_baselines3 import PPO
 
 from ..data.downloaders import YahooFinanceDownloader
 from ..data.normalizers import normalize_df_zscore
@@ -64,10 +65,19 @@ class BatchPredictor:
             device = get_device()
         self.device = device
 
-        # Load model
+        # Load model - try PPO first, then RecurrentPPO
         print(f"Loading model from {self.model_path}")
         print(f"Using device: {self.device}")
-        self.model = RecurrentPPO.load(str(self.model_path), device=self.device)
+
+        # Detect model type by trying to load
+        try:
+            self.model = PPO.load(str(self.model_path), device=self.device)
+            self.is_recurrent = False
+            print("Model type: PPO (MLP)")
+        except Exception:
+            self.model = RecurrentPPO.load(str(self.model_path), device=self.device)
+            self.is_recurrent = True
+            print("Model type: RecurrentPPO (LSTM)")
 
         # Initialize downloader and benchmark
         self.downloader = YahooFinanceDownloader()
@@ -124,6 +134,8 @@ class BatchPredictor:
 
         # Initialize tracking
         obs, _ = env.reset()
+
+        # For RecurrentPPO (LSTM)
         lstm_states = None
         episode_starts = np.ones((1,), dtype=bool)
 
@@ -141,13 +153,16 @@ class BatchPredictor:
         step = 0
 
         while not done:
-            # Predict action
-            action, lstm_states = self.model.predict(
-                obs,
-                state=lstm_states,
-                episode_start=episode_starts,
-                deterministic=True
-            )
+            # Predict action - different for PPO vs RecurrentPPO
+            if self.is_recurrent:
+                action, lstm_states = self.model.predict(
+                    obs,
+                    state=lstm_states,
+                    episode_start=episode_starts,
+                    deterministic=True
+                )
+            else:
+                action, _ = self.model.predict(obs, deterministic=True)
 
             # Execute action
             obs, reward, terminated, truncated, info = env.step(action)

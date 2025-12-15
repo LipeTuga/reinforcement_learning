@@ -2,6 +2,7 @@
 import os
 import argparse
 from sb3_contrib import RecurrentPPO
+from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from dotenv import load_dotenv
 
@@ -62,8 +63,22 @@ def parse_args():
         "--tickers",
         type=str,
         nargs="+",
-        default=["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "NFLX"],
-        help="List of stock tickers to train on (default: 8 major tech stocks)"
+        default=[
+            # Original 8 tech stocks
+            "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "NFLX",
+            # 10 additional diverse stocks for better generalization
+            "JPM",   # JPMorgan - Financials
+            "JNJ",   # Johnson & Johnson - Healthcare
+            "V",     # Visa - Financials/Payments
+            "PG",    # Procter & Gamble - Consumer Staples
+            "UNH",   # UnitedHealth - Healthcare
+            "HD",    # Home Depot - Consumer Discretionary
+            "DIS",   # Disney - Entertainment
+            "BAC",   # Bank of America - Financials
+            "XOM",   # Exxon Mobil - Energy
+            "KO",    # Coca-Cola - Consumer Staples
+        ],
+        help="List of stock tickers to train on (default: 18 diverse stocks)"
     )
     parser.add_argument(
         "--start",
@@ -111,6 +126,11 @@ def parse_args():
         action="store_true",
         help="Disable technical indicators (RSI, MACD, Bollinger Bands)"
     )
+    parser.add_argument(
+        "--use-lstm",
+        action="store_true",
+        help="Use RecurrentPPO with LSTM (default: use PPO without LSTM for GPU compatibility)"
+    )
     return parser.parse_args()
 
 
@@ -126,11 +146,19 @@ def main():
     # Estimate training time
     estimated_time = estimate_training_time(args.timesteps, len(args.tickers), device)
 
+    # Determine model type based on device and flag
+    use_lstm = args.use_lstm
+    if use_lstm and device in ['mps', 'cuda']:
+        print(f"WARNING: LSTM may have issues on {device.upper()}. Consider using --device cpu or removing --use-lstm")
+
+    model_type = "RecurrentPPO (LSTM)" if use_lstm else "PPO (MLP)"
+
     print(f"Training configuration:")
     print(f"  Tickers ({len(args.tickers)}): {', '.join(args.tickers)}")
     print(f"  Date range: {args.start} to {args.end}")
     print(f"  Timesteps: {args.timesteps:,}")
     print(f"  Model name: {args.model_name}")
+    print(f"  Model type: {model_type}")
     print(f"  Technical indicators: {'Disabled' if args.no_indicators else 'Enabled (RSI, MACD, Bollinger Bands)'}")
     print(f"  Estimated time: {estimated_time}")
     print()
@@ -165,10 +193,34 @@ def main():
 
     if args.continue_training and os.path.exists(f"{model_path}.zip"):
         print(f"Loading existing model from {model_path}.zip for continued training.")
-        model = RecurrentPPO.load(model_path, env=vec_env, device=device)
+        if use_lstm:
+            model = RecurrentPPO.load(model_path, env=vec_env, device=device)
+        else:
+            model = PPO.load(model_path, env=vec_env, device=device)
     else:
-        print("Creating new model.")
-        model = RecurrentPPO("MlpLstmPolicy", env=vec_env, verbose=1, device=device)
+        print(f"Creating new {model_type} model with tuned hyperparameters.")
+
+        # Common hyperparameters for both PPO and RecurrentPPO
+        common_params = {
+            "env": vec_env,
+            "verbose": 1,
+            "device": device,
+            "learning_rate": 1e-4,        # Lower LR for stability (default: 3e-4)
+            "n_steps": 2048,              # Steps per update
+            "batch_size": 64,             # Smaller batches for stability
+            "n_epochs": 10,               # Training epochs per update
+            "gamma": 0.99,                # Discount factor
+            "gae_lambda": 0.95,           # GAE lambda
+            "clip_range": 0.2,            # PPO clip range
+            "ent_coef": 0.01,             # Entropy coefficient for exploration
+            "vf_coef": 0.5,               # Value function coefficient
+            "max_grad_norm": 0.5,         # Gradient clipping
+        }
+
+        if use_lstm:
+            model = RecurrentPPO("MlpLstmPolicy", **common_params)
+        else:
+            model = PPO("MlpPolicy", **common_params)
 
     print(f"Training for {args.timesteps} timesteps...")
     model.learn(total_timesteps=args.timesteps, callback=callback)
