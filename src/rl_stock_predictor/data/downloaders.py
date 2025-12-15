@@ -43,26 +43,38 @@ class YahooFinanceDownloader:
         filename = f"{symbol}_{timeframe}.csv"
         return self.data_dir / filename
 
-    def _update_dataset(self, df: pd.DataFrame, end: datetime.date) -> bool:
+    def _cache_covers_range(self, df: pd.DataFrame, start: datetime.date, end: datetime.date) -> bool:
         """
-        Check if the dataset needs updating.
+        Check if the cached dataset covers the requested date range.
 
         Args:
             df: Existing DataFrame
+            start: Requested start date
             end: Requested end date
 
         Returns:
-            True if dataset is up to date, False otherwise
+            True if cache covers the full range, False otherwise
         """
         # Ensure the index is DatetimeIndex for date checking
         if not isinstance(df.index, pd.DatetimeIndex):
             raise ValueError("DataFrame index is not a DatetimeIndex. Please check CSV parsing logic.")
 
-        start_date_in_df = df.index.min().date()
-        end_date_in_df = df.index.max().date()
-        print(f"DataFrame covers from {start_date_in_df} to {end_date_in_df}")
-        print(f"Download {end_date_in_df >= end}")
-        return end_date_in_df >= end
+        cache_start = df.index.min().date()
+        cache_end = df.index.max().date()
+        print(f"Cache covers: {cache_start} to {cache_end}")
+
+        # Check if cache covers the requested range
+        covers_start = cache_start <= start
+        covers_end = cache_end >= end
+        is_valid = covers_start and covers_end
+
+        if not is_valid:
+            if not covers_start:
+                print(f"Cache missing start: need {start}, have {cache_start}")
+            if not covers_end:
+                print(f"Cache missing end: need {end}, have {cache_end}")
+
+        return is_valid
 
     def load_clean_csv(self, path: Path) -> pd.DataFrame:
         """
@@ -108,12 +120,15 @@ class YahooFinanceDownloader:
 
         if os.path.exists(path) and not force:
             df = self.load_clean_csv(path)
-            if self._update_dataset(df, end_date):
-                return df
+            if self._cache_covers_range(df, start_date, end_date):
+                # Filter cached data to requested date range
+                df_filtered = df.loc[start_date:end_date]
+                print(f"Using cached data: {df_filtered.shape[0]} rows ({start_date} to {end_date})")
+                return df_filtered
 
         # Download from yfinance
         df = yf.download(symbol, start=start, end=end, interval=timeframe)
-        print(f"Download {df.shape[0]} rows")
+        print(f"Downloaded {df.shape[0]} rows from Yahoo Finance")
 
         if not df.empty:
             dataset = df.copy()

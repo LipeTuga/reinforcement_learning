@@ -120,14 +120,18 @@ class StockTradingEnv(gym.Env):
             self.number_days_hold = 1  # Reset when not holding
 
         self.net_worth = self.balance + self.shares_held * current_price
-        base_reward = (self.net_worth - self.last_net_worth) * 10
 
+        # Normalized reward: percentage change in net worth (typically -1 to +1 range)
+        # This makes learning much more stable than raw dollar amounts
+        pct_change = (self.net_worth - self.last_net_worth) / self.last_net_worth
+        base_reward = pct_change * 100  # Scale to roughly -1 to +1 for typical daily moves
+
+        # Apply holding penalty after 10 days to encourage active trading
         if self.number_days_hold > 10:
-            # Apply a negative penalty proportional to how long it's been held
-            reward = -abs(base_reward) * (self.number_days_hold - 10)
+            holding_penalty = 0.01 * (self.number_days_hold - 10)  # Small penalty per extra day
+            reward = base_reward - holding_penalty
         else:
-            # Gradually decrease reward as days go by
-            reward = base_reward / self.number_days_hold
+            reward = base_reward
 
         self.cumulative_reward += reward
 
